@@ -9,6 +9,7 @@ import re
 import stat
 import sys
 import time
+from collections import deque
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -159,8 +160,9 @@ class HTBClient:
     ) -> None:
         self.timeout = timeout
         self.debug = debug
-        self.min_interval = 60.0 / requests_per_minute
-        self.last_request_at = 0.0
+        self.requests_per_minute = requests_per_minute
+        self.window_seconds = 60.0
+        self.request_times = deque()
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -176,11 +178,19 @@ class HTBClient:
         )
 
     def _pace(self) -> None:
-        if self.last_request_at <= 0:
-            return
-        remaining = self.min_interval - (time.monotonic() - self.last_request_at)
-        if remaining > 0:
-            time.sleep(remaining)
+        """Rolling-window limiter: allows safe bursts without spacing every request."""
+        while True:
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            while self.request_times and self.request_times[0] <= cutoff:
+                self.request_times.popleft()
+
+            if len(self.request_times) < self.requests_per_minute:
+                self.request_times.append(now)
+                return
+
+            sleep_for = (self.request_times[0] + self.window_seconds) - now + 0.05
+            time.sleep(max(0.05, sleep_for))
 
     def request(
         self,
@@ -203,7 +213,6 @@ class HTBClient:
                     stream=stream,
                     allow_redirects=True,
                 )
-                self.last_request_at = time.monotonic()
             except requests.RequestException as exc:
                 if attempt + 1 >= MAX_RETRIES:
                     raise HTBError(
@@ -459,10 +468,10 @@ def download_one(
             .lower()
         )
 
-        direct_name = filename_from_content_disposition(
-            response.headers.get("Content-Disposition")
-        )
-        output = output_dir / (direct_name or safe_filename(name))
+        # Always use a deterministic local filename. This makes reruns able to
+        # decide locally, before another per-item API request, whether we already
+        # have this writeup.
+        output = output_dir / safe_filename(name)
 
         if output.exists() and not force:
             print(f"[skip] {name} (already exists)")
@@ -514,6 +523,33 @@ def select_targets(
     if limit is not None:
         return targets[:limit]
     return targets
+
+
+def split_local_targets(
+    targets: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    force: bool,
+) -> tuple[list[dict[str, Any]], int]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if force:
+        return targets, 0
+
+    pending: list[dict[str, Any]] = []
+    existing = 0
+
+    for item in targets:
+        name = item_name(item)
+        if not name:
+            continue
+
+        if (output_dir / safe_filename(name)).exists():
+            existing += 1
+        else:
+            pending.append(item)
+
+    return pending, existing
 
 
 def main() -> int:
@@ -572,24 +608,43 @@ def main() -> int:
             debug=args.debug,
         )
 
-        targets = select_targets(list_targets(client), args.name, args.limit)
-        print(f"Retired {KIND} targets: {len(targets)}")
+        targets = select_targets(list_targets(client), args.name, None)
+        output_dir = Path(args.output_dir).expanduser()
+        pending, existing_count = split_local_targets(
+            targets,
+            output_dir,
+            force=args.force,
+        )
+
+        total_missing = len(pending)
+        if args.limit is not None:
+            pending = pending[:args.limit]
+
+        print(f"Retired {KIND} targets : {len(targets)}")
+        if not args.force:
+            print(f"Already downloaded     : {existing_count}")
+            print(f"Missing locally        : {total_missing}")
+        print(f"Queued this run        : {len(pending)}")
 
         counts = {
             "downloaded": 0,
-            "existing": 0,
+            "existing": existing_count,
             "unavailable": 0,
             "failed": 0,
         }
 
-        for index, item in enumerate(targets, start=1):
+        if not pending:
+            print("Nothing to download.")
+            return 0
+
+        for index, item in enumerate(pending, start=1):
             name = item_name(item) or f"id={item.get('id')}"
-            print(f"[{index}/{len(targets)}] {name}")
+            print(f"[{index}/{len(pending)}] {name}")
             try:
                 result = download_one(
                     client,
                     item,
-                    Path(args.output_dir).expanduser(),
+                    output_dir,
                     force=args.force,
                 )
                 counts[result] += 1
