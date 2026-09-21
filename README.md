@@ -2,22 +2,33 @@
 
 Download official HTB writeup PDFs in bulk.
 
+```text
+writeups/
+├── htb_writeup.py
+├── htb_challenge_writeups.py
+├── htb_sherlock_writeups.py
+├── machine/
+├── challenge/
+└── sherlocks/
+```
+
 ```bash
 python3 -m pip install requests
 
 printf '%s' 'YOUR_HTB_TOKEN' > ~/.htb-token
 chmod 600 ~/.htb-token
 
-python3 htb_writeup.py --token-file ~/.htb-token
-python3 htb_challenge_writeups.py --token-file ~/.htb-token
-python3 htb_sherlock_writeups.py --token-file ~/.htb-token
+python3 writeups/htb_writeup.py --token-file ~/.htb-token
+python3 writeups/htb_challenge_writeups.py --token-file ~/.htb-token
+python3 writeups/htb_sherlock_writeups.py --token-file ~/.htb-token
 ```
 
-Use `--limit 5` for a small test run. Existing PDFs are skipped; use `--force` to replace them.
+Each script writes beside itself: Machines to `writeups/machine/`, Challenges to `writeups/challenge/`, and Sherlocks to `writeups/sherlocks/`.
 
-Pass an exact name to download one item, for example:
+Use `--limit 5` for a small test run. Existing PDFs are skipped locally; only missing PDFs are queued. Use `--force` to replace existing files.
+
+Pass an exact name to download one item:
 
 ```bash
-python3 htb_writeup.py Cap --token-file ~/.htb-token
+python3 writeups/htb_writeup.py Cap --token-file ~/.htb-token
 ```
-Reruns first compare the retired list with local PDFs. Already-downloaded writeups are skipped locally without a per-item API request; only missing PDFs are queued. API limiting uses a rolling window, so list pages can be fetched in a short burst while staying under the configured requests/minute limit.
