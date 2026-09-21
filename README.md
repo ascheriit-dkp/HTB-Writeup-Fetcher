@@ -20,3 +20,4 @@ Pass an exact name to download one item, for example:
 ```bash
 python3 htb_writeup.py Cap --token-file ~/.htb-token
 ```
+Reruns first compare the retired list with local PDFs. Already-downloaded writeups are skipped locally without a per-item API request; only missing PDFs are queued. API limiting uses a rolling window, so list pages can be fetched in a short burst while staying under the configured requests/minute limit.
