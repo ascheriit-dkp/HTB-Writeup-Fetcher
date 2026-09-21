@@ -1,25 +1,9 @@
 #!/usr/bin/env python3
-"""
-Download ONE official Hack The Box retired-machine writeup.
-
-Supports both observed HTB behaviors:
-  1. /machine/writeup/<id> returns application/pdf directly
-  2. /machine/writeup/<id> returns JSON containing a temporary signed S3 URL
-
-Single-machine only:
-- no machine enumeration
-- no ID ranges
-- no bulk mode
-
-Examples:
-    python3 htb_writeup.py Cap --token-file ~/.htb-token
-    python3 htb_writeup.py Cap --token-file ~/.htb-token --debug
-"""
+"""Download official writeups for retired Hack The Box machines."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import re
 import stat
@@ -28,50 +12,71 @@ import time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 
-
 API_BASE = "https://labs.hackthebox.com/api/v4"
 APP_ORIGIN = "https://app.hackthebox.com"
-MAX_RETRIES = 5
-
+MAX_RETRIES = 6
+DEFAULT_RPM = 14
 BROWSER_UA = (
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
     "Gecko/20100101 Firefox/128.0"
 )
+
+LIST_ENDPOINT = 'machine/list/retired/paginated'
+WRITEUP_ENDPOINT = 'machine/writeup/{id}'
+DEFAULT_OUTPUT_DIR = 'writeups/machines'
+KIND = 'machine'
 
 
 class HTBError(RuntimeError):
     pass
 
 
-def read_token_file(path: str) -> str:
-    p = Path(path).expanduser()
+class HTBAuthError(HTBError):
+    pass
 
-    try:
-        mode = stat.S_IMODE(p.stat().st_mode)
-        if os.name != "nt" and mode & 0o077:
-            print(
-                f"WARNING: token file permissions are {mode:04o}; "
-                f"consider: chmod 600 {p}",
-                file=sys.stderr,
-            )
-    except OSError:
-        pass
 
-    try:
-        token = p.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise HTBError(f"Could not read token file: {p}") from exc
+class HTBHTTPError(HTBError):
+    def __init__(self, status_code: int, endpoint: str, message: str = "") -> None:
+        self.status_code = status_code
+        self.endpoint = endpoint
+        text = f"HTB returned HTTP {status_code} for /{endpoint}"
+        if message:
+            text += f": {message}"
+        super().__init__(text)
 
-    if not token:
-        raise HTBError(f"Token file is empty: {p}")
+
+def read_token(path: Optional[str]) -> str:
+    if path:
+        p = Path(path).expanduser()
+        try:
+            mode = stat.S_IMODE(p.stat().st_mode)
+            if os.name != "nt" and mode & 0o077:
+                print(
+                    f"WARNING: token file permissions are {mode:04o}; "
+                    f"consider: chmod 600 {p}",
+                    file=sys.stderr,
+                )
+        except OSError:
+            pass
+
+        try:
+            token = p.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise HTBError(f"Could not read token file: {p}") from exc
+    else:
+        token = (os.environ.get("HTB_TOKEN") or "").strip()
 
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
 
+    if not token:
+        raise HTBError(
+            "Missing HTB token. Use --token-file ~/.htb-token or set HTB_TOKEN."
+        )
     return token
 
 
@@ -93,7 +98,7 @@ def safe_filename(name: str) -> str:
     name = Path(name).name
     name = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "_", name).strip(" .")
     if not name:
-        name = "writeup.pdf"
+        name = "writeup"
     if not name.lower().endswith(".pdf"):
         name += ".pdf"
     return name
@@ -103,33 +108,59 @@ def filename_from_content_disposition(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
 
-    m = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", value, flags=re.I)
-    if m:
-        return safe_filename(unquote(m.group(1).strip().strip('"')))
+    match = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", value, flags=re.I)
+    if match:
+        return safe_filename(unquote(match.group(1).strip().strip('"')))
 
-    m = re.search(r'filename\s*=\s*"([^"]+)"', value, flags=re.I)
-    if m:
-        return safe_filename(m.group(1))
+    match = re.search(r'filename\s*=\s*"([^"]+)"', value, flags=re.I)
+    if match:
+        return safe_filename(match.group(1))
 
-    m = re.search(r"filename\s*=\s*([^;]+)", value, flags=re.I)
-    if m:
-        return safe_filename(m.group(1).strip().strip('"'))
+    match = re.search(r"filename\s*=\s*([^;]+)", value, flags=re.I)
+    if match:
+        return safe_filename(match.group(1).strip().strip('"'))
 
     return None
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def positive_int(value: Any) -> Optional[int]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def extract_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        for key in ("data", "machines", "info"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def extract_meta(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict) and isinstance(payload.get("meta"), dict):
+        return payload["meta"]
+    return {}
 
 
 class HTBClient:
-    def __init__(self, token: str, timeout: int = 30, debug: bool = False) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        requests_per_minute: int,
+        timeout: int = 30,
+        debug: bool = False,
+    ) -> None:
         self.timeout = timeout
         self.debug = debug
+        self.min_interval = 60.0 / requests_per_minute
+        self.last_request_at = 0.0
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -144,30 +175,41 @@ class HTBClient:
             }
         )
 
+    def _pace(self) -> None:
+        if self.last_request_at <= 0:
+            return
+        remaining = self.min_interval - (time.monotonic() - self.last_request_at)
+        if remaining > 0:
+            time.sleep(remaining)
+
     def request(
         self,
         endpoint: str,
         *,
+        params: Optional[dict[str, Any]] = None,
         accept: str = "application/json, text/plain, */*",
         stream: bool = False,
     ) -> requests.Response:
         url = f"{API_BASE}/{endpoint.lstrip('/')}"
 
         for attempt in range(MAX_RETRIES):
+            self._pace()
             try:
                 response = self.session.get(
                     url,
+                    params=params,
                     headers={"Accept": accept},
                     timeout=self.timeout,
                     stream=stream,
                     allow_redirects=True,
                 )
+                self.last_request_at = time.monotonic()
             except requests.RequestException as exc:
                 if attempt + 1 >= MAX_RETRIES:
                     raise HTBError(
                         f"Network request failed after {MAX_RETRIES} attempts."
                     ) from exc
-                delay = min(10.0, 0.75 * (2 ** attempt))
+                delay = min(20.0, 0.75 * (2 ** attempt))
                 if self.debug:
                     print(
                         f"[debug] network error; retrying in {delay:.1f}s",
@@ -177,34 +219,25 @@ class HTBClient:
                 continue
 
             if self.debug:
+                remaining = response.headers.get("X-RateLimit-Remaining", "?")
+                limit = response.headers.get("X-RateLimit-Limit", "?")
                 print(
-                    f"[debug] GET /{endpoint.lstrip('/')} "
-                    f"-> {response.status_code}",
-                    file=sys.stderr,
-                )
-                print(
-                    f"[debug] content-type="
-                    f"{response.headers.get('Content-Type', '-')}",
+                    f"[debug] GET /{endpoint.lstrip('/')} -> "
+                    f"{response.status_code} rate={remaining}/{limit}",
                     file=sys.stderr,
                 )
 
             if response.status_code == 429:
                 if attempt + 1 >= MAX_RETRIES:
                     response.close()
-                    raise HTBError("HTB rate limit reached; retry later.")
-
+                    raise HTBError("HTB rate limit reached repeatedly.")
                 delay = retry_after_seconds(
                     response.headers.get("Retry-After"),
-                    min(30.0, 1.0 * (2 ** attempt)),
+                    min(60.0, 2.0 * (2 ** attempt)),
                 )
                 response.close()
-
                 if self.debug:
-                    print(
-                        f"[debug] rate limited; retrying in {delay:.1f}s",
-                        file=sys.stderr,
-                    )
-
+                    print(f"[debug] 429; sleeping {delay:.1f}s", file=sys.stderr)
                 time.sleep(delay)
                 continue
 
@@ -212,9 +245,8 @@ class HTBClient:
                 if attempt + 1 >= MAX_RETRIES:
                     code = response.status_code
                     response.close()
-                    raise HTBError(f"HTB returned HTTP {code} repeatedly.")
-
-                delay = min(10.0, 0.75 * (2 ** attempt))
+                    raise HTBHTTPError(code, endpoint)
+                delay = min(20.0, 0.75 * (2 ** attempt))
                 response.close()
                 time.sleep(delay)
                 continue
@@ -223,109 +255,129 @@ class HTBClient:
 
         raise HTBError("Request failed.")
 
+    def get_json(
+        self,
+        endpoint: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        response = self.request(endpoint, params=params)
+        try:
+            if response.status_code >= 400:
+                snippet = response.text[:200].replace("\n", " ")
+                raise HTBHTTPError(response.status_code, endpoint, snippet)
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise HTBError(
+                    f"HTB returned non-JSON data for /{endpoint}."
+                ) from exc
+        finally:
+            response.close()
 
-def get_json(client: HTBClient, endpoint: str) -> Any:
-    response = client.request(endpoint)
-    try:
-        if response.status_code in (401, 403):
-            raise HTBError(
-                "Authentication/access denied. Check your App Token "
-                "and account access."
+
+def fetch_all_pages(
+    client: HTBClient,
+    endpoint: str,
+    *,
+    extra_params: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    page = 1
+    per_page = 100
+    last_page: Optional[int] = None
+    items: list[dict[str, Any]] = []
+
+    while last_page is None or page <= last_page:
+        params = {"page": page, "per_page": per_page}
+        if extra_params:
+            params.update(extra_params)
+
+        payload = client.get_json(endpoint, params=params)
+        chunk = extract_items(payload)
+        meta = extract_meta(payload)
+        items.extend(chunk)
+
+        if page == 1:
+            last_page = (
+                positive_int(meta.get("last_page"))
+                or positive_int(meta.get("lastPage"))
+                or positive_int(meta.get("pages"))
             )
 
-        if response.status_code == 404:
-            raise HTBError(f"HTB returned 404 for /{endpoint}.")
+        if last_page is None:
+            if len(chunk) < per_page:
+                break
+        elif page >= last_page:
+            break
+        page += 1
 
-        if response.status_code >= 400:
-            raise HTBError(f"HTB returned HTTP {response.status_code}.")
-
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise HTBError("HTB returned non-JSON data unexpectedly.") from exc
-    finally:
-        response.close()
-
-
-def unwrap_info(payload: Any) -> dict[str, Any]:
-    if isinstance(payload, dict) and isinstance(payload.get("info"), dict):
-        return payload["info"]
-    raise HTBError("Unexpected machine-profile response format.")
+    unique: dict[int, dict[str, Any]] = {}
+    for item in items:
+        item_id = positive_int(item.get("id"))
+        if item_id is not None:
+            unique[item_id] = item
+    return list(unique.values())
 
 
-def unwrap_walkthroughs(payload: Any) -> dict[str, Any]:
-    if isinstance(payload, dict) and isinstance(payload.get("message"), dict):
-        return payload["message"]
-    raise HTBError("Unexpected walkthrough response format.")
+def is_retired(item: dict[str, Any]) -> bool:
+    # The endpoint is already retired-only. Keep a defensive check for mixed responses.
+    if "retired" in item:
+        value = item.get("retired")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes")
+    state = str(item.get("state") or "").lower()
+    return not state or state.startswith("retired")
 
 
-def validate_signed_download_url(url: str) -> None:
-    """
-    Avoid following an arbitrary URL with the downloader.
-
-    The current HTB flow returns an HTTPS pre-signed Amazon S3 URL such as:
-      htb-content-prod-private-storage.s3.eu-central-1.amazonaws.com
-    """
-    try:
-        parsed = urlparse(url)
-    except Exception as exc:
-        raise HTBError("HTB returned an invalid download URL.") from exc
-
-    host = (parsed.hostname or "").lower()
-
-    if parsed.scheme != "https":
-        raise HTBError("HTB returned a non-HTTPS download URL.")
-
-    if not host.endswith(".amazonaws.com"):
-        raise HTBError(
-            f"HTB returned an unexpected download host: {host or '<empty>'}"
-        )
-
-    if not parsed.path.startswith("/machines/writeup/"):
-        raise HTBError(
-            "HTB returned an unexpected S3 object path for the writeup."
-        )
+def item_name(item: dict[str, Any]) -> Optional[str]:
+    name = item.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return None
 
 
-def stream_pdf_response_to_file(
-    response: requests.Response,
-    output: Path,
-) -> None:
+def list_targets(client: HTBClient) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in fetch_all_pages(client, LIST_ENDPOINT)
+        if is_retired(item) and item_name(item)
+    ]
+
+
+def validate_download_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise HTBError("HTB returned an invalid/non-HTTPS download URL.")
+
+
+def stream_pdf(response: requests.Response, output: Path) -> None:
     tmp = output.with_name(output.name + ".part")
-
     try:
         prefix = bytearray()
-
         with tmp.open("wb") as fh:
             if os.name != "nt":
                 try:
                     os.chmod(tmp, 0o600)
                 except OSError:
                     pass
-
             for chunk in response.iter_content(chunk_size=128 * 1024):
                 if not chunk:
                     continue
-
                 if len(prefix) < 16:
-                    needed = 16 - len(prefix)
-                    prefix.extend(chunk[:needed])
-
+                    prefix.extend(chunk[: 16 - len(prefix)])
                 fh.write(chunk)
-
-        if not prefix:
-            raise HTBError("The download returned an empty response.")
 
         check = bytes(prefix).lstrip(b"\xef\xbb\xbf \t\r\n")
         if not check.startswith(b"%PDF-"):
             ctype = response.headers.get("Content-Type", "unknown")
             raise HTBError(
-                "The final download did not contain a PDF "
-                f"(Content-Type: {ctype})."
+                f"Final download was not a PDF (Content-Type: {ctype})."
             )
-
         os.replace(tmp, output)
-
     except Exception:
         try:
             tmp.unlink(missing_ok=True)
@@ -334,22 +386,16 @@ def stream_pdf_response_to_file(
         raise
 
 
-def download_from_signed_url(
-    signed_url: str,
-    output: Path,
-    *,
-    debug: bool,
-) -> None:
-    validate_signed_download_url(signed_url)
-
+def download_signed_url(url: str, output: Path, *, debug: bool) -> None:
+    validate_download_url(url)
     try:
         response = requests.get(
-            signed_url,
+            url,
             headers={
                 "User-Agent": BROWSER_UA,
                 "Accept": "application/pdf,application/octet-stream,*/*",
             },
-            timeout=60,
+            timeout=90,
             stream=True,
             allow_redirects=True,
         )
@@ -359,60 +405,57 @@ def download_from_signed_url(
     try:
         if debug:
             print(
-                f"[debug] signed storage GET -> {response.status_code}",
+                f"[debug] storage GET -> {response.status_code} "
+                f"content-type={response.headers.get('Content-Type', '-')}",
                 file=sys.stderr,
             )
-            print(
-                f"[debug] storage content-type="
-                f"{response.headers.get('Content-Type', '-')}",
-                file=sys.stderr,
-            )
-
         if response.status_code == 403:
             raise HTBError(
-                "The signed HTB download URL was rejected or expired. "
-                "Run the command again to obtain a fresh URL."
+                "The signed HTB download URL was rejected or expired."
             )
-
         if response.status_code >= 400:
             raise HTBError(
                 f"HTB storage returned HTTP {response.status_code}."
             )
-
-        stream_pdf_response_to_file(response, output)
-
+        stream_pdf(response, output)
     finally:
         response.close()
 
 
-def download_official_writeup(
+def official_endpoint(item_id: int) -> str:
+    return WRITEUP_ENDPOINT.format(id=item_id)
+
+
+def download_one(
     client: HTBClient,
-    machine_id: int,
-    machine_name: str,
+    item: dict[str, Any],
     output_dir: Path,
-    expected_sha256: Optional[str],
+    *,
     force: bool,
-) -> Path:
-    response = client.request(
-        f"machine/writeup/{machine_id}",
-        accept="application/json, text/plain, */*",
-        stream=True,
-    )
+) -> str:
+    item_id = positive_int(item.get("id"))
+    name = item_name(item)
+    if item_id is None or not name:
+        return "failed"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fallback_output = output_dir / safe_filename(name)
+
+    if fallback_output.exists() and not force:
+        print(f"[skip] {name} (already exists)")
+        return "existing"
+
+    endpoint = official_endpoint(item_id)
+    response = client.request(endpoint, stream=True)
 
     try:
-        if response.status_code in (401, 403):
-            raise HTBError(
-                "HTB denied access to the official writeup. "
-                "Check your subscription/access rights."
-            )
-
-        if response.status_code == 404:
-            raise HTBError("Official writeup was not found.")
-
+        if response.status_code == 401:
+            raise HTBAuthError("HTB returned 401. Check your App Token.")
+        if response.status_code in (403, 404, 422):
+            print(f"[skip] {name} (no accessible official writeup)")
+            return "unavailable"
         if response.status_code >= 400:
-            raise HTBError(
-                f"Writeup request returned HTTP {response.status_code}."
-            )
+            raise HTBHTTPError(response.status_code, endpoint)
 
         ctype = (
             response.headers.get("Content-Type", "")
@@ -421,186 +464,158 @@ def download_official_writeup(
             .lower()
         )
 
-        cd_filename = filename_from_content_disposition(
+        direct_name = filename_from_content_disposition(
             response.headers.get("Content-Disposition")
         )
-        filename = cd_filename or safe_filename(f"{machine_name}.pdf")
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output = output_dir / filename
+        output = output_dir / (direct_name or safe_filename(name))
 
         if output.exists() and not force:
-            raise HTBError(
-                f"File already exists: {output}\n"
-                "Use --force if you intentionally want to replace it."
-            )
+            print(f"[skip] {name} (already exists)")
+            return "existing"
 
         if ctype == "application/pdf":
-            if client.debug:
-                print("[debug] HTB returned PDF directly", file=sys.stderr)
-
-            stream_pdf_response_to_file(response, output)
-
+            stream_pdf(response, output)
         else:
             try:
                 payload = response.json()
             except ValueError as exc:
                 raise HTBError(
-                    "HTB returned neither a PDF nor valid JSON."
+                    f"/{endpoint} returned neither PDF nor valid JSON."
                 ) from exc
 
-            if not isinstance(payload, dict):
-                raise HTBError("Unexpected writeup response format.")
-
-            signed_url = payload.get("url")
-
-            if not isinstance(signed_url, str) or not signed_url.strip():
-                raise HTBError(
-                    "HTB's response did not contain a writeup download URL."
-                )
-
-            if client.debug:
-                print(
-                    "[debug] HTB returned a temporary signed storage URL",
-                    file=sys.stderr,
-                )
+            url = payload.get("url") if isinstance(payload, dict) else None
+            if not isinstance(url, str) or not url.strip():
+                print(f"[skip] {name} (no official writeup URL)")
+                return "unavailable"
 
             response.close()
+            download_signed_url(url.strip(), output, debug=client.debug)
 
-            download_from_signed_url(
-                signed_url.strip(),
-                output,
-                debug=client.debug,
-            )
-
+        print(f"[ok]   {name} -> {output}")
+        return "downloaded"
     finally:
         response.close()
 
-    actual_hash = sha256_file(output)
 
-    if expected_sha256:
-        if actual_hash.lower() != expected_sha256.strip().lower():
-            try:
-                output.unlink()
-            except OSError:
-                pass
-            raise HTBError(
-                "SHA-256 verification failed. "
-                "The downloaded file was deleted."
-            )
-        print(f"SHA-256 : {actual_hash} (verified)")
-    else:
-        print(f"SHA-256 : {actual_hash}")
+def select_targets(
+    targets: list[dict[str, Any]],
+    name: Optional[str],
+    limit: Optional[int],
+) -> list[dict[str, Any]]:
+    targets = sorted(
+        targets,
+        key=lambda item: (item_name(item) or "").casefold(),
+    )
 
-    return output
+    if name:
+        exact = [
+            item for item in targets
+            if (item_name(item) or "").casefold() == name.casefold()
+        ]
+        if not exact:
+            raise HTBError(f"No retired {KIND} named '{name}' was found.")
+        return exact[:1]
+
+    if limit is not None:
+        return targets[:limit]
+    return targets
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download one official retired-machine HTB writeup PDF."
+        description='Download official writeup PDFs for retired HTB machines.',
     )
     parser.add_argument(
-        "machine",
-        help="Exact HTB machine name, for example: Cap",
+        "name",
+        nargs="?",
+        help="Optional exact name. Omit to process all retired items.",
     )
     parser.add_argument(
         "--token-file",
-        help="Read HTB App Token from this file. Preferred.",
+        help="Read HTB App Token from this file.",
     )
     parser.add_argument(
         "--output-dir",
-        default="writeups",
-        help="Destination directory (default: ./writeups)",
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Destination directory (default: {DEFAULT_OUTPUT_DIR}).",
+    )
+    parser.add_argument(
+        "--requests-per-minute",
+        type=int,
+        default=DEFAULT_RPM,
+        help=f"HTB API request rate (default: {DEFAULT_RPM}/min).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Only process the first N retired items (useful for testing).",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite an existing local PDF.",
+        help="Overwrite existing PDFs.",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help=(
-            "Show HTTP status/content diagnostics. "
-            "The HTB token and signed S3 URL are never printed."
-        ),
+        help="Show request diagnostics. Tokens and signed URLs are never printed.",
     )
     args = parser.parse_args()
 
+    if not 1 <= args.requests_per_minute <= 60:
+        print("ERROR: --requests-per-minute must be between 1 and 60.", file=sys.stderr)
+        return 2
+    if args.limit is not None and args.limit < 1:
+        print("ERROR: --limit must be >= 1.", file=sys.stderr)
+        return 2
+
     try:
-        if args.token_file:
-            token = read_token_file(args.token_file)
-        else:
-            token = (os.environ.get("HTB_TOKEN") or "").strip()
-            if token.lower().startswith("bearer "):
-                token = token[7:].strip()
-
-        if not token:
-            raise HTBError(
-                "Missing HTB token. Use --token-file ~/.htb-token "
-                "or set HTB_TOKEN."
-            )
-
-        client = HTBClient(token, debug=args.debug)
-
-        profile = unwrap_info(
-            get_json(
-                client,
-                f"machine/profile/{quote(args.machine, safe='')}",
-            )
+        token = read_token(args.token_file)
+        client = HTBClient(
+            token,
+            requests_per_minute=args.requests_per_minute,
+            debug=args.debug,
         )
 
-        machine_id = profile.get("id")
-        machine_name = str(profile.get("name") or args.machine)
-        retired = bool(profile.get("retired"))
+        targets = select_targets(list_targets(client), args.name, args.limit)
+        print(f"Retired {KIND} targets: {len(targets)}")
 
-        if not isinstance(machine_id, int) or machine_id <= 0:
-            raise HTBError("Machine profile did not contain a valid ID.")
+        counts = {
+            "downloaded": 0,
+            "existing": 0,
+            "unavailable": 0,
+            "failed": 0,
+        }
 
-        if not retired:
-            raise HTBError(
-                f"{machine_name} is not retired. "
-                "This tool intentionally refuses active machines."
-            )
+        for index, item in enumerate(targets, start=1):
+            name = item_name(item) or f"id={item.get('id')}"
+            print(f"[{index}/{len(targets)}] {name}")
+            try:
+                result = download_one(
+                    client,
+                    item,
+                    Path(args.output_dir).expanduser(),
+                    force=args.force,
+                )
+                counts[result] += 1
+            except HTBAuthError:
+                raise
+            except HTBError as exc:
+                print(f"[fail] {name}: {exc}", file=sys.stderr)
+                counts["failed"] += 1
 
-        walkthroughs = unwrap_walkthroughs(
-            get_json(client, f"machine/walkthroughs/{machine_id}")
+        print(
+            "Done. "
+            f"downloaded={counts['downloaded']} "
+            f"existing={counts['existing']} "
+            f"unavailable={counts['unavailable']} "
+            f"failed={counts['failed']}"
         )
-
-        official = walkthroughs.get("official")
-        if not isinstance(official, dict):
-            raise HTBError(
-                f"{machine_name} does not expose an official writeup "
-                "through the walkthrough endpoint."
-            )
-
-        expected_sha256 = official.get("sha256")
-        if not (
-            isinstance(expected_sha256, str)
-            and expected_sha256.strip()
-        ):
-            expected_sha256 = None
-
-        print(f"Machine : {machine_name} (ID {machine_id})")
-        print("Official writeup found.")
-
-        output = download_official_writeup(
-            client=client,
-            machine_id=machine_id,
-            machine_name=machine_name,
-            output_dir=Path(args.output_dir).expanduser(),
-            expected_sha256=expected_sha256,
-            force=args.force,
-        )
-
-        print(f"Saved   : {output}")
-        print("Done.")
-        return 0
+        return 0 if counts["failed"] == 0 else 1
 
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
+        print("\\nInterrupted.", file=sys.stderr)
         return 130
-
     except HTBError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
